@@ -1,0 +1,176 @@
+rules_version = '2';
+
+// Reglas de seguridad de Firestore.
+//
+// Idea general:
+//  - Todo lo que cambia stock, movimientos o usuarios se escribe SOLO desde las Cloud Functions
+//    (el SDK de administración se salta estas reglas). Desde el navegador esas colecciones son de solo lectura.
+//  - Roles (campo `role` de users/{uid}, que solo escriben las Cloud Functions):
+//      worker  = técnico
+//      almacen = personal de almacén: todo el panel actual (stock, historial, catálogo, equipo...)
+//      admin   = todo lo de almacén + las secciones exclusivas de administrador (calendario anual)
+//  - El personal de almacén (almacen y admin) edita catálogo, carpetas, packs, roles técnicos y configuración.
+//  - Un técnico solo lee su propio stock y sus propios movimientos (los que hizo o los traspasos que recibió).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Rol guardado en la ficha del usuario (no en el token): si cambia el rol, el efecto es inmediato.
+    function roleOf() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    // Personal de almacén: rol almacen o admin.
+    function isStaff() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && roleOf() in ['admin', 'almacen'];
+    }
+
+    // Administrador completo (reservado para las secciones exclusivas; calendario anual).
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && roleOf() == 'admin';
+    }
+
+    // Fichas de usuario: las ve cualquiera con sesión (el técnico necesita los nombres para los traspasos).
+    // No contienen contraseñas. Se crean, editan y borran solo desde las Cloud Functions.
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
+    // Catálogo, carpetas, packs, roles técnicos (stock base) y configuración: lee todo el mundo, escribe el almacén.
+    match /catalog/{id} {
+      allow read: if signedIn();
+      allow write: if isStaff();
+    }
+    match /folders/{id} {
+      allow read: if signedIn();
+      allow write: if isStaff();
+    }
+    match /packs/{id} {
+      allow read: if signedIn();
+      allow write: if isStaff();
+    }
+    match /technicianRoles/{id} {
+      allow read: if signedIn();
+      allow write: if isStaff();
+    }
+    match /config/{id} {
+      allow read: if signedIn();
+      allow write: if isStaff();
+    }
+
+    // Stock: un documento por técnico (stock/{uid}). Solo lectura; lo modifican las funciones.
+    match /stock/{id} {
+      allow read: if signedIn() && (isStaff() || resource.data.userId == request.auth.uid);
+      allow write: if false;
+    }
+
+    // Movimientos: solo lectura. El técnico ve los suyos y los traspasos que ha recibido.
+    match /transactions/{id} {
+      allow read: if signedIn() && (
+        isStaff()
+        || resource.data.userId == request.auth.uid
+        || resource.data.counterpartId == request.auth.uid
+      );
+      allow write: if false;
+    }
+
+
+    // ---------------------------------------------------------------------------------------------
+    // Calendario anual (solo administrador). Las fechas son texto AAAA-MM-DD.
+    // ---------------------------------------------------------------------------------------------
+    function isDateText(v) {
+      return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function validEvento(d) {
+      return d.keys().hasOnly(['userId', 'tipo', 'inicio', 'fin', 'estado', 'nota'])
+        && d.keys().hasAll(['userId', 'tipo', 'inicio', 'fin'])
+        && d.userId is string && d.userId.size() > 0
+        && d.tipo in ['vacaciones', 'guardia', 'baja']
+        && isDateText(d.inicio) && isDateText(d.fin) && d.inicio <= d.fin
+        && (d.tipo == 'vacaciones'
+              ? ('estado' in d && d.estado in ['fija', 'flexible'])
+              : !('estado' in d))
+        && (!('nota' in d) || (d.nota is string && d.nota.size() <= 200 && d.tipo != 'baja'));
+    }
+
+    function validFestivo(d) {
+      return d.keys().hasOnly(['fecha', 'ambito', 'provincia', 'nombre'])
+        && d.keys().hasAll(['fecha', 'ambito', 'provincia', 'nombre'])
+        && isDateText(d.fecha)
+        && d.nombre is string && d.nombre.size() > 0 && d.nombre.size() <= 80
+        && ((d.ambito == 'nacional' && d.provincia == null)
+            || (d.ambito == 'provincial' && d.provincia in ['Sevilla', 'Huelva']));
+    }
+
+    match /calendario_eventos/{id} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin() && validEvento(request.resource.data);
+      allow delete: if isAdmin();
+
+      // El técnico lee SOLO sus propias vacaciones y guardias (nunca las bajas ni las de otras personas).
+      // Sus consultas deben llevar userId == su uid y tipo == 'vacaciones' (o 'guardia'), porque las reglas no filtran resultados.
+      allow read: if signedIn() && resource.data.userId == request.auth.uid && resource.data.tipo in ['vacaciones', 'guardia'];
+      // FASE FUTURA (NO ACTIVO): que el técnico vea también las guardias de todos. Añadir:
+      //   allow read: if signedIn() && resource.data.tipo == 'guardia';
+    }
+
+    match /calendario_festivos/{id} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin() && validFestivo(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+
+    // ---------------------------------------------------------------------------------------------
+    // Flota (almacén y administrador): vehículos y quién los tiene. Fechas como texto AAAA-MM-DD.
+    // ---------------------------------------------------------------------------------------------
+    function validVehiculo(d) {
+      return d.keys().hasOnly(['matricula', 'marca', 'modelo', 'itvUltima', 'itvVence', 'nota'])
+        && d.keys().hasAll(['matricula'])
+        && d.matricula is string && d.matricula.matches('^[A-Z0-9]{4,10}$')
+        && (!('marca' in d) || (d.marca is string && d.marca.size() <= 40))
+        && (!('modelo' in d) || (d.modelo is string && d.modelo.size() <= 40))
+        && (!('itvUltima' in d) || isDateText(d.itvUltima))
+        && (!('itvVence' in d) || isDateText(d.itvVence))
+        && (!('nota' in d) || (d.nota is string && d.nota.size() <= 200));
+    }
+
+    function validAsignacion(d) {
+      return d.keys().hasOnly(['vehiculoId', 'tipo', 'userId', 'nombre', 'desde', 'hasta', 'nota'])
+        && d.keys().hasAll(['vehiculoId', 'tipo', 'nombre', 'desde'])
+        && d.vehiculoId is string && d.vehiculoId.size() > 0
+        && d.tipo in ['tecnico', 'nombre']
+        && (d.tipo == 'tecnico' ? ('userId' in d && d.userId is string && d.userId.size() > 0) : !('userId' in d))
+        && d.nombre is string && d.nombre.size() > 0 && d.nombre.size() <= 80
+        && isDateText(d.desde)
+        && (!('hasta' in d) || (isDateText(d.hasta) && d.desde <= d.hasta))
+        && (!('nota' in d) || (d.nota is string && d.nota.size() <= 200));
+    }
+
+    match /flota_vehiculos/{id} {
+      allow read: if isStaff();
+      allow create, update: if isStaff() && validVehiculo(request.resource.data);
+      allow delete: if isStaff();
+    }
+
+    match /flota_asignaciones/{id} {
+      allow read: if isStaff();
+      allow create, update: if isStaff() && validAsignacion(request.resource.data);
+      allow delete: if isStaff();
+    }
+
+    // Todo lo demás, cerrado.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
